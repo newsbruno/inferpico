@@ -9,7 +9,7 @@
 - Per-submission browser consent, automatic expansion of invalid advanced fields, stale-report labels, actionable failure hints and SVG icons.
 - CI for Python 3.10 and 3.14 on Linux, macOS and Windows, including installed-package smoke checks.
 
-Candidate verification: 29 automated tests pass on Python 3.13.3/macOS using synthetic data and loopback fake providers. The installed wheel's CLI, module demo and bundled UI assets pass smoke checks. JavaScript syntax and 16 isolated UI logic assertions pass. Browser runtime/visual QA is blocked and has not passed; the configured cross-platform CI has not run yet. No paid provider calls or model performance/quality claims are part of this candidate.
+Local verification: 29 automated tests pass on Python 3.13.3/macOS using synthetic data and loopback fake providers. The installed wheel's CLI, module demo and bundled UI assets pass smoke checks. JavaScript syntax and 16 isolated UI logic assertions pass. In-app browser checks cover the offline demo and JSON export, fake-provider success/missing usage/HTTP 429, per-run consent, advanced-field validation, retained-result labels, keyboard focus and a 360 px layout. No console errors were observed. The configured cross-platform CI results are reported separately in repository Actions and release notes. No paid provider calls or model performance/quality claims are part of this release.
 
 ## 0.1.0 — 2026-10-18
 
