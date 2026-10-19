@@ -1,14 +1,17 @@
 import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,9 +38,18 @@ class FakeProvider(BaseHTTPRequestHandler):
         if self.path == '/invalidusage': payload['usage'] = {'prompt_tokens': -2, 'completion_tokens': True}
         if self.path == '/badshape': payload = {'error': 'private error'}
         if self.path == '/nullchoice': payload['choices'] = [None]
+        if self.path == '/emptymessage': payload['choices'][0]['message'] = {}
+        if self.path == '/wrongrole': payload['choices'][0]['message']['role'] = 'user'
+        if self.path == '/badcontent': payload['choices'][0]['message']['content'] = {'private': 'secret-key'}
+        if self.path == '/nullcontent': payload['choices'][0]['message']['content'] = None
+        if self.path == '/refusal': payload['choices'][0]['message'].update(content=None, refusal='No.')
+        if self.path == '/tool': payload['choices'][0]['message'].update(content=None, tool_calls=[{'type': 'function', 'function': {'name': 'test', 'arguments': '{}'}}])
+        if self.path == '/mixederror': payload['error'] = 'private prompt secret-key'
         if self.path == '/hugeusage': payload['usage'] = {'prompt_tokens': 10**400, 'completion_tokens': 10**400}
         content = b'not json' if self.path == '/badjson' else json.dumps(payload).encode()
         if self.path == '/big': content = b'x' * (app.MAX_RESPONSE + 1)
+        if self.path == '/nan': content = b'{"choices": [], "usage": NaN}'
+        if self.path == '/deep': content = b'[' * 2000 + b'0' + b']' * 2000
         try: self.wfile.write(content)
         except (BrokenPipeError, ConnectionResetError): pass
 
@@ -86,9 +98,30 @@ class CoreTests(unittest.TestCase):
             self.assertIsNone(result['summary']['p50_ms'])
             self.assertNotIn('secret-key', json.dumps(result))
     def test_invalid_response_errors(self):
-        for path,error in [('/badjson','invalid_json'),('/badshape','invalid_response'),('/nullchoice','invalid_response'),('/big','response_too_large'),('/slow','timeout')]:
+        for path,error in [('/badjson','invalid_json'),('/badshape','invalid_response'),('/nullchoice','invalid_response'),('/emptymessage','invalid_response'),('/wrongrole','invalid_response'),('/badcontent','invalid_response'),('/nullcontent','invalid_response'),('/mixederror','invalid_response'),('/nan','invalid_json'),('/deep','invalid_json'),('/big','response_too_large'),('/slow','timeout')]:
             result=app.run(self.live(path,count=1,timeout=1))
             self.assertEqual(result['requests'][0]['error'],error)
+            self.assertIsInstance(result['requests'][0]['latency_ms'], (int, float))
+            self.assertNotIn('secret-key', json.dumps(result))
+    def test_textless_valid_completions(self):
+        for path in ['/refusal', '/tool']:
+            with self.subTest(path=path):
+                self.assertEqual(app.run(self.live(path,count=1))['summary']['successful'], 1)
+    def test_invalid_key_rejected_before_requests(self):
+        before = len(FakeProvider.seen)
+        for key in ['secret\nkey', 'secret key', 'private\u00e9', 'x' * 8193, 12]:
+            with self.subTest(key_type=type(key)), self.assertRaises(ValueError) as error:
+                app.run(self.live(count=2), key)
+            self.assertNotIn('secret', str(error.exception))
+        self.assertEqual(len(FakeProvider.seen), before)
+    def test_http_error_body_is_closed_without_reading(self):
+        body = io.BytesIO(b'private prompt secret-key')
+        error = urllib.error.HTTPError(self.url, 401, 'secret-key', {}, body)
+        with mock.patch.object(urllib.request.OpenerDirector, 'open', side_effect=error):
+            row = app.request_one(app.config(self.live(count=1)), 0, 'secret-key')
+        self.assertTrue(body.closed)
+        self.assertEqual(row['error'], 'http_401')
+        self.assertNotIn('secret-key', json.dumps(row))
     def test_unknown_usage_not_zero(self):
         for path in ['/missing','/invalidusage','/hugeusage']:
             result=app.run(self.live(path,count=1,input_rate=1,output_rate=2))
@@ -109,11 +142,88 @@ class CoreTests(unittest.TestCase):
         self.assertIn('max_tokens', FakeProvider.seen[-1][2])
 
 
+class CliTests(unittest.TestCase):
+    def cli(self, *args):
+        return subprocess.run([sys.executable, str(app.ROOT / 'inferpico.py'), *args], capture_output=True, text=True)
+    def test_output_existing_and_symlink_preserved_before_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'report.json'
+            destination.write_text('keep this')
+            link = Path(directory) / 'link.json'
+            paths = [destination, Path(directory) / 'missing' / 'report.json']
+            try:
+                link.symlink_to(destination)
+            except OSError:
+                if os.name != 'nt':
+                    raise
+            else:
+                paths.append(link)
+            for path in paths:
+                with self.subTest(path=path), mock.patch.object(app, 'run') as run:
+                    with mock.patch.object(sys, 'argv', ['inferpico', 'demo', '--output', str(path)]), contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as error:
+                            app.main()
+                    self.assertEqual(error.exception.code, 2)
+                    run.assert_not_called()
+            self.assertEqual(destination.read_text(), 'keep this')
+            if link in paths:
+                self.assertTrue(link.is_symlink())
+    def test_output_report_private_and_parseable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'report.json'
+            result = self.cli('demo', '--output', str(destination))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(destination.read_text())['synthetic'])
+            if os.name != 'nt':
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+    def test_interrupted_output_removed_and_exit_130(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'report.json'
+            with mock.patch.object(sys, 'argv', ['inferpico', 'demo', '--output', str(destination)]), mock.patch.object(app, 'run', side_effect=KeyboardInterrupt), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(app.main(), 130)
+            self.assertFalse(destination.exists())
+            self.assertIn('active requests may still be billed', err.getvalue())
+    def test_invalid_settings_do_not_reserve_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'report.json'
+            with mock.patch.object(sys, 'argv', ['inferpico', 'run', '--endpoint', 'http://localhost/fake', '--model', 'fake', '--output', str(destination)]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    app.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(destination.exists())
+    def test_report_write_failure_cleans_file_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'report.json'
+            output = mock.Mock()
+            output.write.side_effect = OSError(28, 'No space left on device')
+            output.close.side_effect = OSError(28, 'No space left on device')
+            real_fdopen = os.fdopen
+            def fake_fdopen(fd, *args, **kwargs):
+                real_fdopen(fd, *args, **kwargs).close()
+                return output
+            with mock.patch.object(sys, 'argv', ['inferpico', 'demo', '--output', str(destination)]), mock.patch.object(os, 'fdopen', side_effect=fake_fdopen), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as error:
+                    app.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(destination.exists())
+            self.assertIn('No space left on device', err.getvalue())
+    def test_interrupt_cancels_queued_work(self):
+        executor = mock.Mock()
+        future = mock.Mock()
+        future.result.side_effect = KeyboardInterrupt
+        executor.submit.return_value = future
+        with mock.patch.object(app.concurrent.futures, 'ThreadPoolExecutor', return_value=executor):
+            with self.assertRaises(KeyboardInterrupt):
+                app.run(dict(mode='live', endpoint='http://localhost/fake', model='fake', confirmed=True, count=4))
+        self.assertEqual(future.cancel.call_count, 4)
+        executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
+
 class ServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.proc=subprocess.Popen([sys.executable,str(app.ROOT/'inferpico.py'),'serve','--port','0'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-        line=cls.proc.stdout.readline(); cls.url=line.strip().split('→ ')[1]
+        line=cls.proc.stdout.readline(); cls.url=line.strip().split('-> ')[1]
         with urllib.request.urlopen(cls.url) as response:
             cls.html=response.read().decode(); cls.csp=response.headers['Content-Security-Policy']
         cls.token=cls.html.split('name="inferpico-token" content="')[1].split('"')[0]
@@ -142,5 +252,15 @@ class ServerTests(unittest.TestCase):
     def test_live_requires_confirmation(self):
         with self.assertRaises(urllib.error.HTTPError) as err: self.post({'mode':'live'})
         self.assertEqual(err.exception.code,400)
+    def test_malformed_json_is_rejected_and_server_survives(self):
+        for body in [b'{"mode": NaN}', b'[' * 2000 + b'0' + b']' * 2000, b'\xff']:
+            request = urllib.request.Request(self.url + '/api/run', data=body, headers={'Origin': self.url, 'Content-Type': 'application/json', 'X-Inferpico-Token': self.token})
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request)
+            with error.exception as response:
+                self.assertEqual(response.code, 400)
+                self.assertLess(len(response.read()), 200)
+        with self.post({'mode': 'demo'}) as response:
+            self.assertEqual(response.status, 200)
 
 if __name__=='__main__': unittest.main()

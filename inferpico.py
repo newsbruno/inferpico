@@ -16,9 +16,38 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 ROOT = Path(__file__).resolve().parent
 MAX_RESPONSE = 2 * 1024 * 1024
+
+
+def load_json(data):
+    """Reject non-JSON numeric constants as well as malformed/deep payloads."""
+    def invalid_constant(value):
+        raise ValueError('Invalid JSON constant.')
+    def check_depth(value, depth=0):
+        if depth > 64:
+            raise ValueError('JSON nesting too deep.')
+        if isinstance(value, dict):
+            for child in value.values():
+                check_depth(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                check_depth(child, depth + 1)
+    try:
+        parsed = json.loads(data, parse_constant=invalid_constant)
+        check_depth(parsed)
+        return parsed
+    except (ValueError, UnicodeError, RecursionError):
+        raise ValueError('Invalid JSON.') from None
+
+
+def validate_key(key):
+    if key is None:
+        return ''
+    if not isinstance(key, str) or len(key) > 8192 or any(not 33 <= ord(c) <= 126 for c in key):
+        raise ValueError('API key must contain only printable ASCII characters with no spaces (up to 8,192 characters).')
+    return key
 
 
 def number(value, name, low, high, integer=False):
@@ -91,6 +120,32 @@ def tokens(usage, field):
     return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000_000 else None
 
 
+def valid_completion(parsed):
+    if not isinstance(parsed, dict) or 'error' in parsed:
+        return False
+    choices = parsed.get('choices')
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    message = choices[0].get('message')
+    if not isinstance(message, dict) or message.get('role') != 'assistant':
+        return False
+    content = message.get('content')
+    if content is not None and not isinstance(content, str):
+        return False
+    if isinstance(content, str):
+        return True
+    # Some compatible providers return a refusal or a tool call without text.
+    if isinstance(message.get('refusal'), str) and message['refusal']:
+        return True
+    calls = message.get('tool_calls')
+    if isinstance(calls, list) and calls:
+        return all(isinstance(call, dict) and call.get('type') == 'function'
+                   and isinstance(call.get('function'), dict)
+                   and isinstance(call['function'].get('name'), str) and bool(call['function']['name'])
+                   and isinstance(call['function'].get('arguments'), str) for call in calls)
+    return False
+
+
 def request_one(settings, index, key):
     start = time.perf_counter()
     row = dict(request=index + 1, ok=False, latency_ms=None, input_tokens=None, output_tokens=None, error=None)
@@ -107,27 +162,33 @@ def request_one(settings, index, key):
             data = response.read(MAX_RESPONSE + 1)
             if len(data) > MAX_RESPONSE:
                 raise ValueError('response_too_large')
-            parsed = json.loads(data)
-        if (not isinstance(parsed, dict) or not isinstance(parsed.get('choices'), list) or not parsed['choices']
-                or not isinstance(parsed['choices'][0], dict) or not isinstance(parsed['choices'][0].get('message'), dict)):
+            try:
+                parsed = load_json(data)
+            except ValueError:
+                row['error'] = 'invalid_json'
+                return row
+        if not valid_completion(parsed):
             raise ValueError('invalid_response')
         row.update(ok=True, input_tokens=tokens(parsed.get('usage'), 'prompt_tokens'),
                    output_tokens=tokens(parsed.get('usage'), 'completion_tokens'))
     except urllib.error.HTTPError as exc:
-        row['error'] = 'http_' + str(exc.code)
-        exc.close()
+        try:
+            row['error'] = 'http_' + str(exc.code)
+        finally:
+            exc.close()
     except (TimeoutError,):
         row['error'] = 'timeout'
     except urllib.error.URLError as exc:
         row['error'] = 'timeout' if isinstance(exc.reason, TimeoutError) else 'connection_or_tls_error'
-    except (json.JSONDecodeError, UnicodeError):
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
         row['error'] = 'invalid_json'
     except ValueError as exc:
         row['error'] = str(exc) if str(exc) in ('response_too_large', 'invalid_response') else 'invalid_response'
     except Exception:
         # Never echo provider errors, which may contain prompts, keys, or URLs.
         row['error'] = 'request_failed'
-    row['latency_ms'] = round((time.perf_counter() - start) * 1000, 2)
+    finally:
+        row['latency_ms'] = round((time.perf_counter() - start) * 1000, 2)
     return row
 
 
@@ -154,6 +215,7 @@ def summarize(settings, rows, elapsed):
             'notes': [
                 'Synthetic demo; no API requests were made. Numbers are illustrative, not benchmark results.' if settings['mode'] == 'demo' else 'Real non-streaming requests. Latency includes connection setup and full response transfer; not time to first token.',
                 'p50 is median; p95 is nearest rank, successful requests only. Small samples are noisy; at fewer than 20 successes p95 is the maximum.',
+                'Timeout applies to blocking socket operations, not a strict wall-clock deadline. A slow trickling response may take longer.',
                 'Cost uses only reported prompt/completion usage and your USD per-million rates. Missing usage is unknown, never zero. Failed requests may still be billed.',
                 'Estimate excludes cache discounts, provider-specific token categories, tools, taxes and minimum charges. Verify the provider invoice. No hard dollar cap.',
                 'No output-quality evaluation is performed. Prompt, key, model ID, endpoint and generated text are excluded from this report.'],
@@ -162,13 +224,26 @@ def summarize(settings, rows, elapsed):
 
 def run(raw, key=None):
     settings = config(raw)
+    key = validate_key(key) if settings['mode'] == 'live' else ''
     start = time.perf_counter()
     if settings['mode'] == 'demo':
         rows = [dict(request=i + 1, ok=True, latency_ms=[362, 518, 441, 694, 407, 560, 480][i % 7],
                      input_tokens=24, output_tokens=48 + i % 5, error=None) for i in range(settings['count'])]
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=settings['concurrency']) as pool:
-            rows = list(pool.map(lambda i: request_one(settings, i, key or ''), range(settings['count'])))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=settings['concurrency'])
+        futures = []
+        try:
+            futures = [pool.submit(request_one, settings, i, key) for i in range(settings['count'])]
+            rows = [future.result() for future in futures]
+        except BaseException:
+            # Stop queued requests on interruption. Active socket operations can
+            # only finish or hit their timeout and may already incur charges.
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
     return summarize(settings, rows, time.perf_counter() - start)
 
 
@@ -221,8 +296,10 @@ def serve(port):
                     return self.reply(413, {'error': 'Request too large or empty.'})
                 if self.headers.get('Content-Type') != 'application/json':
                     return self.reply(415, {'error': 'JSON required.'})
-                raw = json.loads(self.rfile.read(length))
-                config(raw)
+                raw = load_json(self.rfile.read(length))
+                validated = config(raw)
+                if validated['mode'] == 'live':
+                    validate_key(os.environ.get('INFERPICO_API_KEY', ''))
             except (ValueError, TypeError, UnicodeError) as exc:
                 return self.reply(400, {'error': str(exc) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else 'Invalid settings.'})
             if not lock.acquire(blocking=False):
@@ -233,7 +310,7 @@ def serve(port):
             finally:
                 lock.release()
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-    print(f'Inferpico Check → http://127.0.0.1:{server.server_port}\nLocal only. Ctrl+C to stop. No telemetry.', flush=True)
+    print(f'Inferpico Check -> http://127.0.0.1:{server.server_port}\nLocal only. Ctrl+C to stop. No telemetry.', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -272,18 +349,42 @@ def main():
     raw['confirmed'] = raw.get('confirm_paid_run', False)
     if raw['mode'] == 'demo':
         raw.update(input_rate=.5, output_rate=2)
+    output = None
+    complete = False
     try:
-        result = run(raw, os.environ.get('INFERPICO_API_KEY', ''))
+        config(raw)
+        key = validate_key(os.environ.get('INFERPICO_API_KEY', '')) if raw['mode'] == 'live' else ''
+        if args.output:
+            # Reserve the destination before any billable work. The exclusive
+            # open also refuses existing files and symlinks without a race.
+            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            output = os.fdopen(fd, 'w', encoding='utf-8')
+        result = run(raw, key)
+        rendered = json.dumps(result, indent=2) + '\n'
+        if output:
+            output.write(rendered)
+            output.close()
+            complete = True
+            print(f'Saved report to {args.output}')
+        else:
+            print(rendered, end='')
     except ValueError as exc:
         parser.error(str(exc))
-    rendered = json.dumps(result, indent=2) + '\n'
-    if args.output:
-        # Avoid overwriting an existing file accidentally.
-        with args.output.open('x') as output:
-            output.write(rendered)
-        print(f'Saved report to {args.output}')
-    else:
-        print(rendered, end='')
+    except OSError as exc:
+        parser.error('Could not create or write the report: ' + (exc.strerror or 'I/O error') + '.')
+    except KeyboardInterrupt:
+        print('Interrupted. Queued requests were cancelled; active requests may still be billed. No complete report was saved.', file=sys.stderr)
+        return 130
+    finally:
+        if output is not None and not complete:
+            try:
+                output.close()
+            except OSError:
+                pass
+            try:
+                args.output.unlink(missing_ok=True)
+            except OSError:
+                print('Could not remove the incomplete report file.', file=sys.stderr)
     return 1 if result['summary']['failed'] else 0
 
 

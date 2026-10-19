@@ -12,4 +12,12 @@ Reports omit endpoint/model identifiers, prompts, response text, credentials and
 
 Limits reduce accidental load, but are **not a dollar cap**. Providers can bill failures; socket timeouts and closing a browser tab do not guarantee a provider stops generation. The socket timeout does not impose a strict wall-clock deadline. Do not put confidential data in an experimental prompt.
 
-To report a vulnerability, contact the project maintainer through the project's publication channel privately first. Do not post API keys or private prompts in an issue. Rotate exposed keys at their provider immediately. This release has automated tests but has not undergone an independent professional security audit.
+CLI interruption cancels queued work and waits for active socket operations to finish. It cannot revoke requests already accepted by a provider. An interrupted CLI run does not produce a partial report. Output files are created exclusively before requests start, so existing files and symlinks are not overwritten. New reports request owner-only mode `0600` on POSIX; Windows uses inherited ACLs without additional hardening. Report paths should still be in a directory you trust; this does not defend against another process with your user's filesystem permissions.
+
+The offline demo uses fixed synthetic measurements and makes no API calls. The included fake provider binds to loopback and returns synthetic responses; it is only a development fixture. Build/install steps can fetch Python packaging tools, and installing from Git contacts GitHub. Runtime demo/UI assets do not need a network connection beyond local loopback traffic.
+
+## Reporting and supported versions
+
+Security fixes target the latest release. Update to the latest version before reproducing a report; older releases may not receive backports.
+
+Use the repository's **Security → Report a vulnerability** option if enabled. If private reporting is unavailable and you do not have a private maintainer contact, open a minimal issue requesting one without disclosure details. Do not post exploit instructions, API keys, private prompts or provider response bodies publicly. Rotate exposed keys at their provider immediately. This project has automated tests but has not undergone an independent professional security audit.

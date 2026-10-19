@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "tool_version": "0.1.0",
+  "tool_version": "0.2.0",
   "mode": "demo",
   "synthetic": true,
   "settings": {
@@ -28,6 +28,7 @@
   "notes": [
     "Synthetic demo; no API requests were made. Numbers are illustrative, not benchmark results.",
     "p50 is median; p95 is nearest rank, successful requests only. Small samples are noisy; at fewer than 20 successes p95 is the maximum.",
+    "Timeout applies to blocking socket operations, not a strict wall-clock deadline. A slow trickling response may take longer.",
     "Cost uses only reported prompt/completion usage and your USD per-million rates. Missing usage is unknown, never zero. Failed requests may still be billed.",
     "Estimate excludes cache discounts, provider-specific token categories, tools, taxes and minimum charges. Verify the provider invoice. No hard dollar cap.",
     "No output-quality evaluation is performed. Prompt, key, model ID, endpoint and generated text are excluded from this report."

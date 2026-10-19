@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 check.json
 my-demo.json
+build/
+dist/
+*.egg-info/
+.DS_Store
