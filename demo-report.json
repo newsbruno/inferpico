@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.1.0",
+  "mode": "demo",
+  "synthetic": true,
+  "settings": {
+    "count": 5,
+    "concurrency": 1,
+    "timeout": 30.0,
+    "max_tokens": 128,
+    "token_parameter": "max_completion_tokens",
+    "input_rate": 0.5,
+    "output_rate": 2.0
+  },
+  "summary": {
+    "attempted": 5,
+    "successful": 5,
+    "failed": 0,
+    "p50_ms": 441,
+    "p95_ms": 694,
+    "usage_known_requests": 5,
+    "elapsed_seconds": 0.0,
+    "input_tokens": 120,
+    "output_tokens": 250,
+    "known_usage_cost_usd": 0.00056,
+    "estimated_total_cost_usd": 0.00056
+  },
+  "notes": [
+    "Synthetic demo; no API requests were made. Numbers are illustrative, not benchmark results.",
+    "p50 is median; p95 is nearest rank, successful requests only. Small samples are noisy; at fewer than 20 successes p95 is the maximum.",
+    "Cost uses only reported prompt/completion usage and your USD per-million rates. Missing usage is unknown, never zero. Failed requests may still be billed.",
+    "Estimate excludes cache discounts, provider-specific token categories, tools, taxes and minimum charges. Verify the provider invoice. No hard dollar cap.",
+    "No output-quality evaluation is performed. Prompt, key, model ID, endpoint and generated text are excluded from this report."
+  ],
+  "requests": [
+    {
+      "request": 1,
+      "ok": true,
+      "latency_ms": 362,
+      "input_tokens": 24,
+      "output_tokens": 48,
+      "error": null
+    },
+    {
+      "request": 2,
+      "ok": true,
+      "latency_ms": 518,
+      "input_tokens": 24,
+      "output_tokens": 49,
+      "error": null
+    },
+    {
+      "request": 3,
+      "ok": true,
+      "latency_ms": 441,
+      "input_tokens": 24,
+      "output_tokens": 50,
+      "error": null
+    },
+    {
+      "request": 4,
+      "ok": true,
+      "latency_ms": 694,
+      "input_tokens": 24,
+      "output_tokens": 51,
+      "error": null
+    },
+    {
+      "request": 5,
+      "ok": true,
+      "latency_ms": 407,
+      "input_tokens": 24,
+      "output_tokens": 52,
+      "error": null
+    }
+  ]
+}
